@@ -4,15 +4,19 @@ import enum
 import itertools
 import socket
 import sys
+import threading
+from collections import deque
 from contextlib import contextmanager
+from select import select
 from typing import TYPE_CHECKING, Literal
 
 import attr
-from outcome import Value
+from outcome import Error, Value
 
 from .. import _core
 from ._io_common import wake_all
 from ._run import _public
+from ._wakeup_socketpair import WakeupSocketpair
 from ._windows_cffi import (
     INVALID_HANDLE_VALUE,
     AFDPollFlags,
@@ -209,7 +213,10 @@ def _get_underlying_socket(sock, *, which=WSAIoctls.SIO_BASE_HANDLE):
     )
     if failed:
         code = ws2_32.WSAGetLastError()
-        raise_winerror(code)
+        if code == 10045:  # TODO find/create constant
+            return ffi.cast("HANDLE", sock)
+        else:
+            raise_winerror(code)
     return base_ptr[0]
 
 
@@ -378,13 +385,6 @@ class _WindowsStatistics:
     backend: Literal["windows"] = attr.ib(init=False, default="windows")
 
 
-# Maximum number of events to dequeue from the completion port on each pass
-# through the run loop. Somewhat arbitrary. Should be large enough to collect
-# a good set of tasks on each loop, but not so large to waste tons of memory.
-# (Each WindowsIOManager holds a buffer whose size is ~32x this number.)
-MAX_EVENTS = 1000
-
-
 @attr.s(frozen=True)
 class CompletionKeyEventInfo:
     lpOverlapped = attr.ib()
@@ -398,18 +398,36 @@ class WindowsIOManager:
         # touches to safe values up front, before we do anything that can
         # fail.
         self._iocp = None
+        self._iocp_queue = deque()
+        self._iocp_thread = None
         self._all_afd_handles = []
 
         self._iocp = _check(
             kernel32.CreateIoCompletionPort(INVALID_HANDLE_VALUE, ffi.NULL, 0, 0)
         )
-        self._events = ffi.new("OVERLAPPED_ENTRY[]", MAX_EVENTS)
+        self._events = None
 
         self._vacant_afd_groups = set()
         # {lpOverlapped: AFDPollOp}
         self._afd_ops = {}
         # {socket handle: AFDWaiters}
         self._afd_waiters = {}
+
+        self._have_afd = True
+        try:
+            afd_handle = _afd_helper_handle()
+            kernel32.CloseHandle(afd_handle)
+        except OSError:
+            self._have_afd = False
+
+        # {stdlib socket object: task}
+        # except that wakeup socket is mapped to None
+        self._socket_waiters = {"read": {}, "write": {}}
+        self._main_thread_waker = WakeupSocketpair()
+        wakeup_sock = self._main_thread_waker.wakeup_sock
+        self._socket_waiters["read"][wakeup_sock] = None
+        # {task: result}
+        self._ready_socket_waiters = {}
 
         # {lpOverlapped: task}
         self._overlapped_waiters = {}
@@ -465,13 +483,16 @@ class WindowsIOManager:
             while self._all_afd_handles:
                 afd_handle = self._all_afd_handles.pop()
                 _check(kernel32.CloseHandle(afd_handle))
+        if self._iocp_thread is not None:
+            self._iocp_thread.join()
+        self._main_thread_waker.close()
 
     def __del__(self):
         self.close()
 
     def statistics(self):
-        tasks_waiting_read = 0
-        tasks_waiting_write = 0
+        tasks_waiting_read = len(self._socket_waiters["read"])
+        tasks_waiting_write = len(self._socket_waiters["write"])
         for waiter in self._afd_waiters.values():
             if waiter.read_task is not None:
                 tasks_waiting_read += 1
@@ -492,25 +513,129 @@ class WindowsIOManager:
         )
 
     def get_events(self, timeout: float) -> EventResult:
-        received = ffi.new("PULONG")
-        milliseconds = round(1000 * timeout)
-        if timeout > 0 and milliseconds == 0:
-            milliseconds = 1
-        try:
-            _check(
-                kernel32.GetQueuedCompletionStatusEx(
-                    self._iocp, self._events, MAX_EVENTS, received, milliseconds, 0
-                )
+        # Step 0: the first time through, initialize the IOCP thread
+        if self._iocp_thread is None:
+            # The rare non-daemonic thread -- close() should always be called,
+            # even on error paths, and we want to join it there.
+            self._iocp_thread = threading.Thread(
+                target=self._iocp_thread_fn, name="trio-IOCP"
             )
-        except OSError as exc:
-            if exc.winerror != ErrorCodes.WAIT_TIMEOUT:  # pragma: no cover
-                raise
-            return 0
-        result = received[0]
-        assert isinstance(result, int)
+            self._iocp_thread.start()
+
+        # Step 1: select for sockets, with the given timeout.
+        # If there are events queued from the IOCP thread, then the timeout is
+        # implicitly reduced to 0 b/c the wakeup socket has pending data in
+        # it.
+        def socket_ready(what, sock, result):
+            task = self._socket_waiters[what].pop(sock)
+            self._ready_socket_waiters[task] = result
+
+        def socket_check(what, sock):
+            try:
+                select([sock], [sock], [sock], 0)
+            except OSError as exc:
+                socket_ready(what, sock, Error(exc))
+
+        def do_select():
+            r_waiting = list(self._socket_waiters["read"].keys())
+            w_waiting = list(self._socket_waiters["write"].keys())
+
+            if r_waiting == [self._main_thread_waker.wakeup_sock]:
+                r_waiting = []
+
+            if len(r_waiting) + len(w_waiting) == 0:
+                return [], []
+
+            # We select for exceptional conditions on the writable set because
+            # on Windows, a failed non-blocking connect shows up as
+            # "exceptional". Everyone else uses "writable" for this, so we
+            # normalize it.
+            r, w1, w2 = select(r_waiting, w_waiting, w_waiting, timeout)
+            return r, set(w1 + w2)
+
+        try:
+            r, w = do_select()
+        except OSError:
+            # Some socket was closed or similar. Track it down and get rid of
+            # it.
+            for what in ["read", "write"]:
+                for sock in self._socket_waiters[what]:
+                    socket_check(what, sock)
+            r, w = do_select()
+
+        for sock in r:
+            if sock is not self._main_thread_waker.wakeup_sock:
+                socket_ready("read", sock, None)
+        for sock in w:
+            socket_ready("write", sock, None)
+
+        # Step 2: drain the wakeup socket.
+        # This must be done before checking the IOCP queue.
+        self._main_thread_waker.drain()
+
+        # Step 3: process the IOCP queue. If new events arrive while we're
+        # processing the queue then we leave them for next time.
+        # XX should probably have some sort emergency bail out if the queue
+        # gets too long?
+        result = 0
+        if len(self._iocp_queue):
+            msg = self._iocp_queue.popleft()
+            if isinstance(msg, BaseException):
+                # IOCP thread encountered some unexpected error -- give up and
+                # let the user know.
+                raise msg
+            batch, received = msg
+            self._events = batch
+            result = received
         return result
 
+    def _iocp_thread_fn(self):
+        # This thread sits calling GetQueuedCompletionStatusEx forever. To
+        # signal that it should shut down, the main thread just closes the
+        # IOCP, which causes GetQueuedCompletionStatusEx to return with an
+        # error:
+        IOCP_CLOSED_ERRORS = {
+            # If the IOCP is closed while we're blocked in
+            # GetQueuedCompletionStatusEx, then we get this error:
+            ErrorCodes.ERROR_ABANDONED_WAIT_0,
+            # If the IOCP is already closed when we initiate a
+            # GetQueuedCompletionStatusEx, then we get this error:
+            ErrorCodes.ERROR_INVALID_HANDLE,
+        }
+        iocp = self._iocp
+        while True:
+            max_events = 1024  # TODO go back to original constant at top of file?
+            batch = ffi.new("OVERLAPPED_ENTRY[]", max_events)
+            received = ffi.new("PULONG")
+            # https://msdn.microsoft.com/en-us/library/windows/desktop/aa364988(v=vs.85).aspx
+            # TODO 100 because otherwise we never wake up on exit. wine bug or my fault?
+            try:
+                _check(
+                    kernel32.GetQueuedCompletionStatusEx(
+                        iocp, batch, max_events, received, 100, 0
+                    )
+                )
+            except OSError as exc:
+                if exc.winerror == ErrorCodes.WAIT_TIMEOUT:
+                    continue
+                if exc.winerror in IOCP_CLOSED_ERRORS:
+                    # The IOCP handle was closed; time to shut down.
+                    return
+                else:
+                    self._iocp_queue.append(exc)
+                    return
+            self._iocp_queue.append((batch, received[0]))
+            self._main_thread_waker.wakeup_thread_and_signal_safe()
+
     def process_events(self, received: EventResult) -> None:
+        # TODO: maybe this doesn't belong here, but it can't go in get_events() because reschedule has to be called from an async context
+        for task, result in self._ready_socket_waiters.items():
+            if result is not None:
+                _core.reschedule(task, result)
+            else:
+                _core.reschedule(task)
+        self._ready_socket_waiters = {}
+
         for i in range(received):
             entry = self._events[i]
             if entry.lpCompletionKey == CKeys.AFD_POLL:
@@ -703,21 +828,48 @@ class WindowsIOManager:
 
         await _core.wait_task_rescheduled(abort_fn)
 
+    async def _wait_socket(self, sock, mode):
+        if not isinstance(sock, int):
+            sock = sock.fileno()
+        if sock in self._socket_waiters[mode]:
+            raise _core.BusyResourceError
+        self._socket_waiters[mode][sock] = _core.current_task()
+
+        def abort_fn(_):
+            del self._socket_waiters[mode][sock]
+            return _core.Abort.SUCCEEDED
+
+        await _core.wait_task_rescheduled(abort_fn)
+
     @_public
     async def wait_readable(self, sock):
-        await self._afd_poll(sock, "read_task")
+        if self._have_afd:
+            await self._afd_poll(sock, "read_task")
+        else:
+            await self._wait_socket(sock, "read")
 
     @_public
     async def wait_writable(self, sock):
-        await self._afd_poll(sock, "write_task")
+        if self._have_afd:
+            await self._afd_poll(sock, "write_task")
+        else:
+            await self._wait_socket(sock, "write")
 
     @_public
-    def notify_closing(self, handle):
-        handle = _get_base_socket(handle)
-        waiters = self._afd_waiters.get(handle)
-        if waiters is not None:
-            wake_all(waiters, _core.ClosedResourceError())
-            self._refresh_afd(handle)
+    def notify_closing(self, sock):
+        if self._have_afd:
+            handle = _get_base_socket(sock)
+            waiters = self._afd_waiters.get(handle)
+            if waiters is not None:
+                wake_all(waiters, _core.ClosedResourceError())
+                self._refresh_afd(handle)
+        else:
+            if not isinstance(sock, int):
+                sock = sock.fileno()
+            for mode in ("read", "write"):
+                if sock in self._socket_waiters[mode]:
+                    task = self._socket_waiters[mode].pop(sock)
+                    _core.reschedule(task, Error(_core.ClosedResourceError()))
 
     ################################################################
     # Regular overlapped operations
